@@ -540,6 +540,124 @@ class DatabaseService {
 
     return chapters;
   }
+  async initializeFTS5Table(db: SQLiteDb): Promise<void> {
+  // First drop the existing table if it exists
+  await db.execAsync(`DROP TABLE IF EXISTS verses_fts;`);
+  
+  // Then create it with the correct column name
+  await db.execAsync(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS verses_fts USING fts5(
+      verseID UNINDEXED,
+      humanReadableID UNINDEXED,
+      text,
+      tokenize='unicode61 remove_diacritics 1'
+    );
+  `);
+}
+ async populateFTS5Table(db: SQLiteDb): Promise<void> {
+    await db.execAsync(`DELETE FROM verses_fts;`);
+    await db.execAsync(`
+      INSERT INTO verses_fts(verseID, humanReadableID, text)
+      SELECT verseID, humanReadableID, text FROM verses;
+    `);
+    const count = await db.getFirstAsync<{ count: number }>(
+      "SELECT COUNT(*) as count FROM verses_fts"
+    );
+    console.log(`FTS5 table populated with ${count?.count} verses`);
+  }
+  async searchVerses(db: SQLiteDb, searchTerm: string): Promise<Verse[]> {
+  if (!searchTerm.trim()) {
+    return [];
+  }
+
+  try {
+    // Format search term for FTS5
+    const words = searchTerm.trim().split(/\s+/);
+    const ftsQuery = words.map(w => `"${w}"*`).join(' ');
+    
+    console.log('FTS Query:', ftsQuery);
+    
+    // First, let's check if the table exists and has data
+    const tableCheck = await db.getFirstAsync<{ count: number }>(
+      "SELECT COUNT(*) as count FROM verses_fts;"
+    );
+    console.log(`FTS5 table has ${tableCheck?.count} rows`);
+    
+    // Try a simple query to see what's in the table
+    const sampleRows = await db.getAllAsync(
+      "SELECT verseID, humanReadableID, substr(text, 1, 50) as text_preview FROM verses_fts LIMIT 3;"
+    );
+    console.log('Sample rows:', sampleRows);
+    
+    // Now perform the search
+    const verseIds = await db.getAllAsync<{ verseID: number }>(
+      `SELECT DISTINCT verseID FROM verses_fts WHERE verses_fts MATCH ? ORDER BY verseID;`,
+      [ftsQuery]
+    );
+    
+    console.log(`Found ${verseIds.length} matching verse IDs`);
+    
+    if (verseIds.length === 0) {
+      return [];
+    }
+    
+    const ids = verseIds.map(v => v.verseID);
+    const placeholders = ids.map(() => '?').join(',');
+    
+    const verses = await db.getAllAsync<VerseRow>(
+      `SELECT * FROM verses WHERE verseID IN (${placeholders}) ORDER BY verseID;`,
+      ids
+    );
+    
+    console.log(`Retrieved ${verses.length} full verses`);
+    return verses.map(verse => this.mapVerseRow(verse, [], []));
+    
+  } catch (error) {
+    console.error('Search error:', error);
+    return [];
+  }
+}
+async searchVersesSimple(db: SQLiteDb, searchTerm: string): Promise<Verse[]> {
+  if (!searchTerm.trim()) {
+    return [];
+  }
+
+  try {
+    const words = searchTerm.trim().split(/\s+/);
+    
+    let query = 'SELECT * FROM verses WHERE';
+    const params: any[] = [];
+    const conditions: string[] = [];
+    
+    words.forEach(word => {
+      // For Arabic, LIKE works fine. For English/non-Arabic, you might want case-insensitive
+      conditions.push(`(text LIKE ? OR searchableText LIKE ?)`);
+      params.push(`%${word}%`, `%${word}%`);
+    });
+    
+    query += ' ' + conditions.join(' AND ');
+    query += ' ORDER BY verseID LIMIT 100;';
+    
+    const verses = await db.getAllAsync<VerseRow>(query, params);
+    return verses.map(verse => this.mapVerseRow(verse, [], []));
+    
+  } catch (error) {
+    console.error('Search error:', error);
+    return [];
+  }
+}
+// Add an index to improve search performance (run once)
+async createSearchIndexes(db: SQLiteDb): Promise<void> {
+  try {
+    await db.execAsync(`
+      CREATE INDEX IF NOT EXISTS idx_verses_text ON verses(text);
+      CREATE INDEX IF NOT EXISTS idx_verses_searchableText ON verses(searchableText);
+    `);
+    console.log('Search indexes created');
+  } catch (error) {
+    console.error('Error creating indexes:', error);
+  }
+}
 }
 
 export const databaseService = new DatabaseService();
